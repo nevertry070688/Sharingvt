@@ -1,0 +1,449 @@
+/*
+ * rtos_sim.c
+ *
+ * Emulates a hard-RTOS style single-CPU cooperative scheduler on top of
+ * Linux/PREEMPT_RT pthreads.
+ *
+ *   - Exactly one thread is ever "running" (holds the CPU token) at a time.
+ *   - A thread keeps the token until it calls one of: rtos_delay(),
+ *     rtos_sleep(), or rtos_timesleep().
+ *   - rtos_timesleep() blocks until rtos_wakeup() is called on it, or the
+ *     timeout expires -- whichever comes first.
+ *   - rtos_delay()/rtos_sleep() are NOT interruptible by wakeup(); a
+ *     wakeup() delivered during a delay is latched (pending_flag) and
+ *     consumed by the *next* timesleep() call, matching typical RTOS
+ *     "pending event" semantics.
+ *   - rtos_rcv_msg()/rtos_snd_msg() are built from the exact same
+ *     block/wake machinery as timesleep/wakeup: rcv_msg blocks until a
+ *     message is available or timeout, snd_msg enqueues a message and
+ *     wakes a blocked receiver, with the same call-time ordering
+ *     guarantee. The mailbox's own occupancy count plays the role that
+ *     pending_flag plays for wakeup -- see the comments on each function.
+ *   - Ordering guarantee: if you call rtos_wakeup(A) then rtos_wakeup(B),
+ *     A is placed in the ready queue before B, regardless of which OS
+ *     thread the Linux scheduler happens to run first. This is done by
+ *     pushing the target directly onto the ready queue *inside*
+ *     rtos_wakeup(), under the global lock -- not by letting the woken
+ *     thread push itself later (which would only reflect Linux scheduling
+ *     order, not call order).
+ *
+ * Build:   gcc -O2 -Wall -o rtos_sim rtos_sim.c -lpthread
+ * Run as root (or with CAP_SYS_NICE) to get SCHED_FIFO.
+ */
+
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <errno.h>
+#include <unistd.h>
+
+#define NTHREADS   4
+#define RQ_CAP     NTHREADS   /* at most NTHREADS threads can ever be ready */
+#define MSG_MAX_LEN 32        /* max bytes per message */
+#define MBOX_DEPTH  8         /* messages a mailbox can hold before full */
+
+typedef enum {
+    TH_RUNNING,
+    TH_READY,
+    TH_BLOCKED_SLEEP,      /* rtos_delay/rtos_sleep - not wakeable */
+    TH_BLOCKED_TIMESLEEP,  /* rtos_timesleep - wakeable by rtos_wakeup */
+    TH_BLOCKED_RECV        /* rtos_rcv_msg - wakeable by rtos_snd_msg */
+} state_t;
+
+typedef struct {
+    int           sender_id;
+    size_t        len;
+    unsigned char data[MSG_MAX_LEN];
+} msg_t;
+
+typedef struct {
+    int             id;
+    pthread_t       tid;
+    pthread_cond_t  cv;
+    volatile int    pending_flag;  /* count of outstanding wakeups; each
+                                     * timesleep() consumes exactly one */
+    state_t         state;
+
+    /* Private mailbox for rtos_snd_msg/rtos_rcv_msg (FIFO ring buffer).
+     * mb_count plays exactly the role pending_flag plays for wakeup:
+     * its 0 -> nonzero transition is what triggers waking a blocked
+     * receiver, and rcv_msg's fast path is "mb_count > 0 already". */
+    msg_t           mailbox[MBOX_DEPTH];
+    int             mb_head, mb_tail, mb_count;
+} thread_t;
+
+static thread_t threads[NTHREADS];
+
+static pthread_mutex_t g_lock;        /* single lock protects everything below */
+static int  rq[RQ_CAP];
+static int  rq_head = 0, rq_tail = 0, rq_count = 0;
+static int  current = -1;             /* id of thread currently holding CPU */
+
+/* ---------- time helpers ---------- */
+
+static struct timespec deadline_from_now(int ms)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    ts.tv_sec  += ms / 1000;
+    ts.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_nsec -= 1000000000L;
+        ts.tv_sec  += 1;
+    }
+    return ts;
+}
+
+/* ---------- ready queue (must hold g_lock) ---------- */
+
+static void rq_push(int id)
+{
+    rq[rq_tail] = id;
+    rq_tail = (rq_tail + 1) % RQ_CAP;
+    rq_count++;
+}
+
+static int rq_pop(void)
+{
+    int id = rq[rq_head];
+    rq_head = (rq_head + 1) % RQ_CAP;
+    rq_count--;
+    return id;
+}
+
+/* Only call when current == -1 (CPU idle). Hands the token to the head
+ * of the FIFO ready queue, if any. */
+static void schedule_next_locked(void)
+{
+    if (current == -1 && rq_count > 0) {
+        int id = rq_pop();
+        threads[id].state = TH_RUNNING;
+        current = id;
+        pthread_cond_signal(&threads[id].cv);
+    }
+}
+
+/* Called by the thread that currently owns the token, right before it
+ * blocks. Frees the token and immediately hands it to whoever is next. */
+static void release_cpu_locked(void)
+{
+    current = -1;
+    schedule_next_locked();
+}
+
+/* Block until it's this thread's turn to hold the token. Caller must have
+ * already set self->state and (if needed) pushed self onto rq. */
+static void wait_for_turn_locked(thread_t *self)
+{
+    while (current != self->id)
+        pthread_cond_wait(&self->cv, &g_lock);
+    self->state = TH_RUNNING;
+}
+
+static void join_ready_and_wait_locked(thread_t *self)
+{
+    self->state = TH_READY;
+    rq_push(self->id);
+    if (current == -1)
+        schedule_next_locked();
+    wait_for_turn_locked(self);
+}
+
+/* ---------- public RTOS-style API ---------- */
+
+/* Non-wakeable delay. Gives up the CPU for the full duration. */
+void rtos_delay(int id, int ms)
+{
+    thread_t *self = &threads[id];
+    struct timespec deadline = deadline_from_now(ms);
+
+    pthread_mutex_lock(&g_lock);
+    self->state = TH_BLOCKED_SLEEP;
+    release_cpu_locked();
+
+    for (;;) {
+        int rc = pthread_cond_timedwait(&self->cv, &g_lock, &deadline);
+        if (rc == ETIMEDOUT)
+            break;
+        /* Nothing signals a TH_BLOCKED_SLEEP thread's cv (wakeup() only
+         * signals TH_BLOCKED_TIMESLEEP threads), so a non-ETIMEDOUT
+         * return here would only be a spurious wake -- loop and recheck. */
+    }
+
+    join_ready_and_wait_locked(self);
+    pthread_mutex_unlock(&g_lock);
+}
+
+void rtos_sleep(int id, int seconds)
+{
+    rtos_delay(id, seconds * 1000);
+}
+
+/* Blocks until rtos_wakeup(id) or timeout. Returns 1 if woken, 0 if timed out. */
+int rtos_timesleep(int id, int ms)
+{
+    thread_t *self = &threads[id];
+    int result;
+
+    pthread_mutex_lock(&g_lock);
+
+    /* Fast path: one or more wakeups already happened earlier (e.g. during
+     * a prior rtos_delay) and are latched in the counter. Consume exactly
+     * one and return immediately -- no CPU release, thread keeps running.
+     * Any remaining count stays latched for the next timesleep() call. */
+    if (self->pending_flag > 0) {
+        self->pending_flag--;
+        pthread_mutex_unlock(&g_lock);
+        return 1;
+    }
+
+    struct timespec deadline = deadline_from_now(ms);
+    self->state = TH_BLOCKED_TIMESLEEP;
+    release_cpu_locked();
+
+    while (self->state == TH_BLOCKED_TIMESLEEP) {
+        int rc = pthread_cond_timedwait(&self->cv, &g_lock, &deadline);
+        if (rc == ETIMEDOUT)
+            break;   /* state unchanged -> genuine timeout */
+        /* else: rc==0. If rtos_wakeup() ran, it already changed our
+         * state to TH_READY and pushed us onto rq (see below), so the
+         * loop condition will now be false and we fall through. */
+    }
+
+    if (self->state == TH_READY) {
+        /* Woken: rtos_wakeup() already enqueued us, in call order. Consume
+         * exactly one wakeup; if more accumulated meanwhile, they stay
+         * latched for the following timesleep() call(s). */
+        self->pending_flag--;
+        result = 1;
+        wait_for_turn_locked(self);
+    } else {
+        /* Timed out: nobody queued us, do it ourselves. pending_flag is
+         * guaranteed 0 here -- if a wakeup had arrived, it would have
+         * flipped state to TH_READY under the same lock before we could
+         * observe ETIMEDOUT. */
+        result = 0;
+        join_ready_and_wait_locked(self);
+    }
+
+    pthread_mutex_unlock(&g_lock);
+    return result;
+}
+
+/* Wakes thread `id`. pending_flag is a counter, not a boolean: each call
+ * to rtos_wakeup() adds one outstanding wakeup, and each rtos_timesleep()
+ * call consumes exactly one. So N calls to rtos_wakeup(id) followed by N
+ * calls to rtos_timesleep(id, ...) return "woken" N times, in order --
+ * none of them are lost or coalesced.
+ *
+ * If the thread is currently blocked in timesleep, this places it on the
+ * ready queue right now (fixing its position relative to any other
+ * wakeup() calls made around the same time) and signals it. That queueing
+ * only happens on the 0->1 transition of the counter: a second, third,
+ * etc. wakeup delivered while the thread is already on its way back to
+ * running just adds to the count without pushing it again. If the thread
+ * isn't in timesleep at all, the wakeup is simply latched in the counter
+ * for a future timesleep() call. Safe to call from any of the 4 threads. */
+void rtos_wakeup(int id)
+{
+    thread_t *t = &threads[id];
+
+    pthread_mutex_lock(&g_lock);
+    int was_zero = (t->pending_flag == 0);
+    t->pending_flag++;
+    if (was_zero && t->state == TH_BLOCKED_TIMESLEEP) {
+        t->state = TH_READY;
+        rq_push(t->id);              /* ordering fixed HERE, at call time */
+        pthread_cond_signal(&t->cv);
+        if (current == -1)
+            schedule_next_locked();
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
+/* ---------- message passing (same pattern as timesleep/wakeup) ---------- */
+
+/* Blocks the calling thread until a message arrives in its own mailbox,
+ * or timeout_ms elapses. Returns the sender's id on success (>=0), or -1
+ * on timeout. On success, up to buf_len bytes of the message are copied
+ * into buf.
+ *
+ * This is structurally identical to rtos_timesleep(): mb_count > 0 is
+ * the fast path (message already waiting -- dequeue without giving up
+ * the CPU, exactly like an already-latched pending_flag), otherwise the
+ * thread releases the token, blocks on its own cv, and is either handed
+ * back to TH_READY by rtos_snd_msg() or times out. */
+int rtos_rcv_msg(int id, void *buf, size_t buf_len, int timeout_ms)
+{
+    thread_t *self = &threads[id];
+
+    pthread_mutex_lock(&g_lock);
+
+    if (self->mb_count == 0) {
+        struct timespec deadline = deadline_from_now(timeout_ms);
+        self->state = TH_BLOCKED_RECV;
+        release_cpu_locked();
+
+        while (self->state == TH_BLOCKED_RECV) {
+            int rc = pthread_cond_timedwait(&self->cv, &g_lock, &deadline);
+            if (rc == ETIMEDOUT)
+                break;   /* state unchanged -> genuine timeout, mailbox still empty */
+        }
+
+        if (self->state != TH_READY) {
+            /* Timed out: nobody queued us, do it ourselves. */
+            join_ready_and_wait_locked(self);
+            pthread_mutex_unlock(&g_lock);
+            return -1;
+        }
+        /* Woken: rtos_snd_msg() already enqueued us, in call order. */
+        wait_for_turn_locked(self);
+    }
+
+    /* Mailbox is guaranteed non-empty here (either it already was, or a
+     * message arrived while we were blocked). */
+    msg_t *m = &self->mailbox[self->mb_head];
+    size_t n = m->len < buf_len ? m->len : buf_len;
+    memcpy(buf, m->data, n);
+    int sender = m->sender_id;
+    self->mb_head = (self->mb_head + 1) % MBOX_DEPTH;
+    self->mb_count--;
+
+    pthread_mutex_unlock(&g_lock);
+    return sender;
+}
+
+/* Sends a message to thread `dest_id`'s mailbox. Returns 0 on success,
+ * -1 if the destination mailbox is full (see note below).
+ *
+ * The sender's own id doesn't need to be passed in: because only the
+ * thread currently holding the CPU token can be executing at all, the
+ * scheduler's own `current` variable *is* the caller's id.
+ *
+ * Mirrors rtos_wakeup() exactly: the 0 -> nonzero transition of the
+ * destination's mb_count is what queues it (at this call's position in
+ * time, fixing ordering the same way rtos_wakeup() does), and a
+ * destination that's already running/ready/blocked-elsewhere just gets
+ * the message appended to its mailbox for a future rcv_msg() to find. */
+int rtos_snd_msg(int dest_id, const void *data, size_t len)
+{
+    thread_t *t = &threads[dest_id];
+    if (len > MSG_MAX_LEN)
+        return -1;
+
+    pthread_mutex_lock(&g_lock);
+
+    if (t->mb_count == MBOX_DEPTH) {
+        /* Mailbox full. This implementation reports it back to the sender
+         * rather than blocking the sender for space; if your original
+         * RTOS's snd_msg blocks (or drops-oldest) on a full queue instead,
+         * that policy goes here. */
+        pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
+
+    int was_empty = (t->mb_count == 0);
+    msg_t *m = &t->mailbox[t->mb_tail];
+    m->sender_id = current;   /* caller == whoever currently holds the token */
+    m->len = len;
+    memcpy(m->data, data, len);
+    t->mb_tail = (t->mb_tail + 1) % MBOX_DEPTH;
+    t->mb_count++;
+
+    if (was_empty && t->state == TH_BLOCKED_RECV) {
+        t->state = TH_READY;
+        rq_push(t->id);              /* ordering fixed HERE, at call time */
+        pthread_cond_signal(&t->cv);
+        if (current == -1)
+            schedule_next_locked();
+    }
+
+    pthread_mutex_unlock(&g_lock);
+    return 0;
+}
+
+
+
+static void pin_and_prioritize(pthread_t tid, int prio)
+{
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(0, &cpuset);   /* single CPU, as in the original target */
+    pthread_setaffinity_np(tid, sizeof(cpuset), &cpuset);
+
+    struct sched_param sp = { .sched_priority = prio };
+    /* Same priority for all 4: the token protocol -- not pthread priority --
+     * decides who runs. SCHED_FIFO here just minimizes wakeup latency and
+     * keeps non-RT system threads from butting in. */
+    pthread_setschedparam(tid, SCHED_FIFO, &sp);
+}
+
+/* --- example application bodies: replace with your ported thread code --- */
+
+static void *thread_body(void *arg)
+{
+    int id = (int)(intptr_t)arg;
+
+    for (;;) {
+        printf("thread %d running\n", id);
+
+        if (id == 0) {
+            rtos_wakeup(1);       /* order test: wakeup(1) before wakeup(2) below */
+            rtos_wakeup(2);
+            rtos_snd_msg(3, "hi", 2);
+            rtos_delay(id, 200);
+        } else if (id == 3) {
+            char buf[MSG_MAX_LEN];
+            int sender = rtos_rcv_msg(id, buf, sizeof(buf), 500);
+            if (sender >= 0)
+                printf("thread %d got msg from %d\n", id, sender);
+            else
+                printf("thread %d rcv_msg timed out\n", id);
+        } else {
+            int woken = rtos_timesleep(id, 500);
+            printf("thread %d woke: %s\n", id, woken ? "wakeup" : "timeout");
+        }
+    }
+    return NULL;
+}
+
+int main(void)
+{
+    pthread_mutexattr_t mattr;
+    pthread_mutexattr_init(&mattr);
+    pthread_mutexattr_setprotocol(&mattr, PTHREAD_PRIO_INHERIT); /* avoid priority inversion under PREEMPT_RT */
+    pthread_mutex_init(&g_lock, &mattr);
+
+    for (int i = 0; i < NTHREADS; i++) {
+        threads[i].id = i;
+        threads[i].pending_flag = 0;
+        threads[i].state = TH_READY;
+        threads[i].mb_head = threads[i].mb_tail = threads[i].mb_count = 0;
+        pthread_cond_init(&threads[i].cv, NULL);
+    }
+
+    /* Seed the ready queue with the desired start order before any thread
+     * runs its body, and hand the token to the first one. */
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < NTHREADS; i++)
+        rq_push(i);
+    schedule_next_locked();
+    pthread_mutex_unlock(&g_lock);
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+
+    for (int i = 0; i < NTHREADS; i++) {
+        pthread_create(&threads[i].tid, &attr, thread_body, (void *)(intptr_t)i);
+        pin_and_prioritize(threads[i].tid, 50);
+    }
+
+    for (int i = 0; i < NTHREADS; i++)
+        pthread_join(threads[i].tid, NULL);
+
+    return 0;
+}
